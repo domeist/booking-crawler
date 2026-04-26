@@ -1,7 +1,6 @@
 import asyncio
 import json
 import random
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -170,7 +169,7 @@ async def _fast_fetch_reviews(page, context, initial_url: str, initial_body: str
 
 
 async def scrape_fast(url: str, headless: bool = False, debug: bool = False) -> dict:
-    console.print(f"\n[bold cyan]Launching browser (fast mode)...[/bold cyan]")
+    console.print("\n[bold cyan]Launching browser (fast mode)...[/bold cyan]")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -201,7 +200,7 @@ async def scrape_fast(url: str, headless: bool = False, debug: bool = False) -> 
                     if op == "ReviewList":
                         captured_gql["url"] = req.url
                         captured_gql["body"] = pd
-                        console.print(f"  [dim]Intercepted ReviewList GQL[/dim]")
+                        console.print("  [dim]Intercepted ReviewList GQL[/dim]")
                 except Exception:
                     pass
             await route.continue_()
@@ -251,13 +250,12 @@ async def scrape_fast(url: str, headless: bool = False, debug: bool = False) -> 
 
         # Determine whether we ended up on a dedicated /reviews/ page or inline
         current_url = page.url
-        is_old_ui = await page.locator('li.review_item').count() > 0
 
         if "reviews" in urlparse(current_url).path:
             # Dedicated reviews page — use offset URL pagination
             console.print("[bold cyan]Paginating through reviews (offset URL)...[/bold cyan]")
             reviews_base = current_url.split("?")[0]
-            reviews = await _scrape_all_reviews(page, reviews_base, is_old_ui)
+            reviews = await _scrape_all_reviews(page, reviews_base)
         elif captured_gql.get("url"):
             # Inline reviews + captured GraphQL — fast-fetch remaining pages
             console.print("[bold cyan]Fast-fetching all reviews via GraphQL...[/bold cyan]")
