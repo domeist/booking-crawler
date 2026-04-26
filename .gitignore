@@ -1,0 +1,32 @@
+# Output files — contain scraped data and personal URLs
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Debug dumps
+debug_*.html
+debug_*.png
+
+# OS
+.DS_Store
+Thumbs.db

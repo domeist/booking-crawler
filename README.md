@@ -1,0 +1,135 @@
+# booking-crawler
+
+A CLI tool that scrapes all guest reviews and property metadata from any [Booking.com](https://www.booking.com) hotel page and saves them as a readable text report. Designed to feed into an AI for summarisation — upload the output file to [Claude.ai](https://claude.ai) and ask it to summarise the reviews.
+
+---
+
+## Features
+
+- Scrapes **all reviews** from any property, regardless of count (tested up to 825+)
+- Extracts property metadata: name, address, type, overall score, category scores, amenities, description
+- Two scraper modes: **standard** (reliable, browser-based) and **fast** (GraphQL interception, ~50× faster)
+- Anti-bot measures: stealth browser patching, randomised delays, non-headless mode by default
+- Clean text output — no JSON, no databases, just a file you can read or paste into an AI
+
+---
+
+## How it works
+
+### Standard scraper
+Opens a real browser, navigates to the property page, clicks "Read all reviews", then clicks "Next" repeatedly — exactly as a human would. Extracts 10 reviews per click, detects when the last page is reached via content-change polling and deduplication.
+
+### Fast scraper
+Booking.com loads reviews via a GraphQL API (`/dml/graphql`). When "Read all reviews" is clicked, the browser fires a `ReviewList` GraphQL request with pagination variables (`skip`, `limit`). The fast scraper intercepts this request using Playwright's network routing, captures the URL, cookies, and query body, then replays it directly with `httpx` for each page — incrementing `skip` by 10 each time. The browser is only used for the initial page load and authentication; all review fetching happens over raw HTTP.
+
+**Why so much faster:** the standard scraper renders a full browser page per click (JavaScript execution, React re-renders, DOM painting). The fast scraper skips all of that and talks directly to the API, receiving raw JSON. A 427-review hotel goes from ~15 minutes to ~30 seconds.
+
+---
+
+## Installation
+
+Requires Python 3.10+.
+
+```bash
+git clone https://github.com/yourusername/booking-crawler.git
+cd booking-crawler
+
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+---
+
+## Usage
+
+```bash
+# Standard scraper
+python crawl.py "https://www.booking.com/hotel/gb/example.html"
+
+# Fast scraper (recommended for large hotels)
+python crawl_fast.py "https://www.booking.com/hotel/gb/example.html"
+
+# Custom output path
+python crawl.py <url> --output my-report.txt
+
+# Headless mode (less visible but more likely to trigger bot detection)
+python crawl.py <url> --headless
+
+# Save debug screenshot and HTML dump (useful if scraping breaks)
+python crawl.py <url> --debug
+```
+
+The report is saved to `results/<property-name>.txt` by default.
+
+---
+
+## Output format
+
+```
+PROPERTY: The Grand Hotel
+URL: https://www.booking.com/hotel/gb/the-grand.html
+Scraped: 2026-04-26
+
+Address: 1 Grand Street, London
+Type: Hotel
+Overall score: 9.2 (Superb)
+
+Score breakdown:
+  Staff: 9.6
+  Cleanliness: 9.4
+  ...
+
+============================================================
+REVIEWS (312 total)
+============================================================
+
+--- Review 1 ---
+Alice, United Kingdom, 2026-03-15
+Score: 10
+Liked: Incredible staff, spotless room, amazing breakfast.
+Disliked: Parking was a bit tricky.
+...
+```
+
+Upload this file to [Claude.ai](https://claude.ai) and ask it to summarise, identify common complaints, or answer specific questions.
+
+---
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| `playwright` | Browser automation — controls a real Chromium browser |
+| `playwright-stealth` | Patches browser fingerprints to avoid bot detection |
+| `httpx` | Async HTTP client — used by the fast scraper to replay GraphQL requests |
+| `beautifulsoup4` | HTML parsing fallback |
+| `rich` | Coloured terminal output |
+
+---
+
+## Architecture
+
+```
+crawl.py          — CLI entry point (standard)
+crawl_fast.py     — CLI entry point (fast)
+scraper.py        — Standard Playwright-based scraper
+scraper_fast.py   — Fast scraper: GraphQL interception + httpx
+requirements.txt
+```
+
+`scraper_fast.py` imports helpers directly from `scraper.py` (metadata extraction, cookie banner dismissal, fallback click-loop) so there is no duplicated logic.
+
+---
+
+## Limitations & notes
+
+- **Bot detection:** Booking.com actively detects automation. Non-headless mode (the default) is significantly more reliable. If you get blocked or see a CAPTCHA, the scraper exits with a clear message — solve it manually in the browser window and re-run.
+- **Selector drift:** Booking.com changes its CSS classes frequently. Selectors use `data-testid` attributes where possible (more stable), with class-name fallbacks. If scraping breaks after a site update, inspect the page and update selectors in `scraper.py`.
+- **GraphQL token:** The fast scraper uses the `chal_t` challenge token from the intercepted request. This token is session-bound and generated by AWS WAF — it cannot be pre-generated, which is why the browser is still needed for the initial page load.
+- **Results folder:** The `results/` directory is gitignored — scraped reports are not committed.
+
+---
+
+## Legal & ethical use
+
+This tool is intended for personal research and analysis of publicly visible review data. Review Booking.com's Terms of Service before use. Do not use this tool for commercial data harvesting, bulk scraping at scale, or any purpose that violates the platform's terms.
