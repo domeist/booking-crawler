@@ -42,3 +42,23 @@ def test_wait_until_returns_as_soon_as_the_condition_holds():
 
 def test_wait_until_gives_up_and_reports_failure():
     assert asyncio.run(browser.wait_until(lambda: False, timeout_s=0.05, interval_s=0.01)) is False
+
+
+def test_a_missing_browser_becomes_an_install_instruction():
+    hint = browser.browser_setup_hint(
+        "BrowserType.launch: Executable doesn't exist at /home/x/chrome-headless-shell"
+    )
+    assert "playwright install chromium" in hint
+    assert "--with-deps" not in hint
+
+
+def test_missing_system_libraries_point_at_the_with_deps_command():
+    hint = browser.browser_setup_hint(
+        "chrome-headless-shell: error while loading shared libraries: libnspr4.so"
+    )
+    assert "--with-deps" in hint
+
+
+def test_an_unrelated_launch_failure_gets_no_hint():
+    assert browser.browser_setup_hint("Target page, context or browser has been closed") is None
+    assert browser.browser_setup_hint("") is None

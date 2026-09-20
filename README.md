@@ -27,16 +27,16 @@ Report saved to results/guest-house-shtaka.txt
 Requires Python 3.10+.
 
 ```bash
-git clone https://github.com/domeist/booking-crawler.git
-cd booking-crawler
-
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install --with-deps chromium
+git clone https://github.com/domeist/booking-crawler.git && cd booking-crawler
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && playwright install --with-deps chromium
 ```
 
-`--with-deps` installs the system libraries Chromium needs and will ask for `sudo` on Linux.
-On macOS and Windows you can drop it: `python -m playwright install chromium`.
+That last step is separate from `pip` on purpose: it downloads a Chromium build and the
+system libraries it needs, which is why `--with-deps` asks for `sudo` on Linux. On macOS and
+Windows, drop it — `playwright install chromium`. If you skip the step entirely, the first
+run tells you exactly which command to run.
+
+On Windows the activation line differs: `.venv\Scripts\activate`.
 
 ## Use
 

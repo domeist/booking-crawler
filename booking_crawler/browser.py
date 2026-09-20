@@ -57,6 +57,16 @@ _BOT_CHECK_SELECTORS = (
     'h1:has-text("not a robot")',
 )
 
+BROWSER_MISSING_MESSAGE = (
+    "Chromium is not installed. Run:\n"
+    "    python -m playwright install chromium"
+)
+BROWSER_DEPS_MISSING_MESSAGE = (
+    "Chromium is installed but the system libraries it needs are not. Run:\n"
+    "    python -m playwright install --with-deps chromium\n"
+    "(that step asks for sudo; on macOS and Windows drop --with-deps)"
+)
+
 BOT_CHECK_MESSAGE = (
     "Booking.com served a bot check instead of the property page. "
     "Re-run without --headless, solve it in the browser window, then try again."
@@ -79,6 +89,20 @@ def launch_args() -> list[str]:
     return args
 
 
+def browser_setup_hint(error_message: str) -> str | None:
+    """Turn Playwright's launch failure into the command that fixes it.
+
+    Installing the browser is a separate step from installing the package, so
+    this is the first thing a new user hits if they skip it.
+    """
+    message = (error_message or "").lower()
+    if "shared libraries" in message or "missing dependencies" in message:
+        return BROWSER_DEPS_MISSING_MESSAGE
+    if "executable doesn't exist" in message or "playwright install" in message:
+        return BROWSER_MISSING_MESSAGE
+    return None
+
+
 async def human_delay(low: float = 0.5, high: float = 2.0) -> None:
     """Pause for a random interval, so interactions are not perfectly timed."""
     await asyncio.sleep(random.uniform(low, high))
@@ -88,7 +112,13 @@ async def human_delay(low: float = 0.5, high: float = 2.0) -> None:
 async def browser_page(headless: bool):
     """Yield a stealth-patched page and its context, closing the browser after."""
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless, args=launch_args())
+        try:
+            browser = await playwright.chromium.launch(headless=headless, args=launch_args())
+        except PlaywrightError as exc:
+            hint = browser_setup_hint(str(exc))
+            if hint:
+                raise ScrapeError(hint) from exc
+            raise
         try:
             context = await browser.new_context(
                 user_agent=chrome_user_agent(browser.version),
