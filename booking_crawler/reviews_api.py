@@ -15,16 +15,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
+from playwright.async_api import Error as PlaywrightError
 
 from .models import deduplicate, empty_review
 
 GRAPHQL_OPERATION = "ReviewList"
 GRAPHQL_ROUTE_PATTERN = "**/graphql**"
 REQUEST_TIMEOUT_S = 20.0
-MAX_PAGES = 2_000
+MAX_API_PAGES = 2_000
 
 # The page asks for 10 reviews at a time; the API serves 25 just as happily,
 # which cuts the number of requests a large property needs by more than half.
+# `skip` still advances by the number of cards actually returned, so a server
+# that clamps the limit costs extra requests rather than losing reviews.
 PAGE_SIZE = 25
 
 # An occasional page comes back empty or 502s even though more reviews exist.
@@ -34,6 +37,10 @@ RETRY_BACKOFF_S = 1.5
 
 # Rebuilt per request by httpx, or meaningless outside the browser.
 _DROPPED_HEADERS = frozenset({"host", "content-length", "accept-encoding", "cookie"})
+
+# The response fields parse_review_card maps. If a whole page lacks one, the
+# schema has moved and the reviews would parse into blanks.
+_REQUIRED_CARD_FIELDS = ("textDetails", "guestDetails", "reviewUrl")
 
 
 @dataclass
@@ -96,7 +103,7 @@ async def intercept_review_list(page):
     finally:
         try:
             await page.unroute(GRAPHQL_ROUTE_PATTERN, handle)
-        except Exception:
+        except PlaywrightError:  # the page may already be closing
             pass
 
 
@@ -118,12 +125,10 @@ def format_review_date(raw) -> str:
 
 def format_score(raw) -> str:
     """Render a score without a trailing .0, so 10.0 prints as 10."""
-    if isinstance(raw, dict):
-        raw = raw.get("score", "")
     if raw in (None, ""):
         return ""
     try:
-        value = float(raw)
+        value = float(str(raw).replace(",", "."))
     except (TypeError, ValueError):
         return str(raw)
     return str(int(value)) if value.is_integer() else f"{value:g}"
@@ -156,6 +161,7 @@ def parse_review_card(card: dict) -> dict | None:
     room = booking.get("roomType") or {}
 
     review = empty_review()
+    # reviewUrl is booking.com's own per-review identifier, not a link.
     review["review_id"] = str(card.get("reviewUrl") or "")
     review["reviewer"] = guest.get("username") or ("Anonymous" if guest.get("anonymous") else "")
     review["country"] = guest.get("countryName") or guest.get("countryCode") or ""
@@ -174,6 +180,21 @@ def parse_review_card(card: dict) -> dict | None:
     return review
 
 
+def detect_schema_drift(cards: list[dict]) -> str | None:
+    """Name the response field that has moved, if the schema no longer matches.
+
+    Without this a renamed field parses into blank reviews and the run still
+    reports success — reviews with no text also dedupe into a handful, because
+    only the API's own id distinguishes them.
+    """
+    if not cards:
+        return None
+    for name in _REQUIRED_CARD_FIELDS:
+        if not any(isinstance(card, dict) and card.get(name) for card in cards):
+            return name
+    return None
+
+
 def _cards_from_response(payload: dict) -> tuple[list[dict], int | None]:
     """Return (raw review cards, total review count) from one API response."""
     reviews = (payload.get("data") or {}).get("reviewListFrontend") or {}
@@ -182,12 +203,13 @@ def _cards_from_response(payload: dict) -> tuple[list[dict], int | None]:
     return (cards if isinstance(cards, list) else []), (total if isinstance(total, int) else None)
 
 
-async def _fetch_page(client, request: ReviewListRequest, skip: int, page_size: int):
+async def _fetch_page(client, request: ReviewListRequest, skip: int, page_size: int, *, retry_empty: bool):
     """Fetch one page, retrying transient failures.
 
     Returns (cards, total, error). A failure is returned rather than raised so
     that an error near the end of a long scrape keeps the reviews already
-    collected instead of discarding them.
+    collected instead of discarding them. `retry_empty` is False once every
+    review is accounted for, so the last page is not re-requested three times.
     """
     error = None
     for attempt in range(PAGE_ATTEMPTS):
@@ -197,7 +219,7 @@ async def _fetch_page(client, request: ReviewListRequest, skip: int, page_size: 
             )
             response.raise_for_status()
             cards, total = _cards_from_response(response.json())
-            if cards:
+            if cards or not retry_empty:
                 return cards, total, None
             error = None
         except (httpx.HTTPError, ValueError) as exc:
@@ -215,12 +237,18 @@ async def fetch_all_reviews(
     *,
     on_progress=None,
     on_error=None,
+    on_drift=None,
 ) -> list[dict]:
-    """Page through the review API until it stops returning new reviews."""
+    """Page through the review API until it stops returning new reviews.
+
+    Returns an empty list when the response schema has drifted, so the caller
+    can fall back to reading the page instead of reporting blank reviews.
+    """
     reviews: list[dict] = []
     seen: set[str] = set()
     page_size = max(request.page_size, PAGE_SIZE)
     total = None
+    skip = 0
     # A review added mid-scrape shifts the pages, so one page of pure
     # duplicates is not the end of the list — two in a row is.
     duplicate_pages = 0
@@ -231,22 +259,36 @@ async def fetch_all_reviews(
         follow_redirects=True,
         timeout=REQUEST_TIMEOUT_S,
     ) as client:
-        for page_number in range(MAX_PAGES):
-            skip = page_number * page_size
+        for page_number in range(MAX_API_PAGES):
             if on_progress:
                 on_progress(len(reviews), total)
 
-            cards, reported_total, error = await _fetch_page(client, request, skip, page_size)
+            expecting_more = total is None or len(reviews) < total
+            cards, reported_total, error = await _fetch_page(
+                client, request, skip, page_size, retry_empty=expecting_more
+            )
             if error is not None:
                 if on_error:
                     on_error(error)
                 break
+
+            if page_number == 0:
+                drifted = detect_schema_drift(cards)
+                if drifted:
+                    if on_drift:
+                        on_drift(drifted)
+                    return []
+
             if total is None:
                 total = reported_total
 
             parsed = [review for review in map(parse_review_card, cards) if review]
             fresh = deduplicate(parsed, seen)
             reviews.extend(fresh)
+
+            # Advance by what the server actually sent, not by what was asked
+            # for: a clamped limit then costs extra requests, not reviews.
+            skip += len(cards)
 
             duplicate_pages = 0 if fresh else duplicate_pages + 1
             if not cards or duplicate_pages >= 2:

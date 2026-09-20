@@ -8,15 +8,20 @@ import asyncio
 import re
 from datetime import datetime
 
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.async_api import (
+    Error as PlaywrightError,
+    Page,
+    TimeoutError as PlaywrightTimeout,
+)
 
 from .browser import human_delay
 from .models import deduplicate, empty_review
 
+# Selectors verified against booking.com on 2026-09-19.
 REVIEW_CARD_SELECTOR = '[data-testid="review-card"]'
 _CARDS_READY_TIMEOUT_MS = 15_000
 _PAGE_CHANGE_TIMEOUT_S = 12.0
-MAX_PAGES = 500
+MAX_REVIEW_PAGES = 500
 
 _FIELD_SELECTORS = {
     "title": '[data-testid="review-title"]',
@@ -122,7 +127,7 @@ def compose_stay(stay_info: str, room: str, traveller_type: str) -> str:
 async def _card_text(card, selector: str, timeout: int = 1500) -> str:
     try:
         return (await card.locator(selector).first.inner_text(timeout=timeout)).strip()
-    except Exception:
+    except PlaywrightError:
         return ""
 
 
@@ -168,7 +173,7 @@ async def _wait_for_new_page(page: Page, previous_first_card: str) -> None:
         await asyncio.sleep(0.4)
         try:
             current = await page.locator(REVIEW_CARD_SELECTOR).first.inner_text(timeout=1000)
-        except Exception:
+        except PlaywrightError:
             return
         if current != previous_first_card:
             return
@@ -189,7 +194,7 @@ async def paginate_reviews(page: Page, *, on_progress=None) -> list[dict]:
     reviews: list[dict] = []
     seen: set[str] = set()
 
-    for _ in range(MAX_PAGES):
+    for _ in range(MAX_REVIEW_PAGES):
         if on_progress:
             on_progress(len(reviews), None)
 
@@ -200,7 +205,7 @@ async def paginate_reviews(page: Page, *, on_progress=None) -> list[dict]:
 
         try:
             first_card = await page.locator(REVIEW_CARD_SELECTOR).first.inner_text(timeout=2000)
-        except Exception:
+        except PlaywrightError:
             first_card = ""
 
         if not await page.evaluate(_CLICK_NEXT_JS):

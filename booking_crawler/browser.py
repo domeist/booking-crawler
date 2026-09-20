@@ -1,11 +1,14 @@
 """Browser setup and the page interactions both scrape modes share."""
 
 import asyncio
+import os
 import random
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from playwright.async_api import (
+    Error as PlaywrightError,
     Page,
     TimeoutError as PlaywrightTimeout,
     async_playwright,
@@ -14,15 +17,19 @@ from playwright_stealth import Stealth
 
 from .errors import ScrapeError
 
-USER_AGENT = (
+# Claiming a Chrome version the bundled Chromium does not have is itself a
+# bot signal, so the real version is filled in at launch.
+USER_AGENT_TEMPLATE = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/{version} Safari/537.36"
 )
+FALLBACK_CHROME_VERSION = "124.0.0.0"
 VIEWPORT = {"width": 1440, "height": 900}
 LOCALE = "en-GB"
 NAVIGATION_TIMEOUT_MS = 45_000
 
+# Selectors verified against booking.com on 2026-09-19.
 _COOKIE_BANNER_SELECTORS = (
     '[id*="onetrust-accept"]',
     "button[data-gdpr-consent]",
@@ -52,6 +59,22 @@ BOT_CHECK_MESSAGE = (
 )
 
 
+def chrome_user_agent(browser_version: str) -> str:
+    """Build a desktop Chrome user agent matching the running browser."""
+    match = re.match(r"\d+(?:\.\d+)*", browser_version or "")
+    return USER_AGENT_TEMPLATE.format(version=match.group(0) if match else FALLBACK_CHROME_VERSION)
+
+
+def launch_args() -> list[str]:
+    """Chromium flags. The sandbox is only disabled where it cannot work."""
+    args = ["--disable-blink-features=AutomationControlled"]
+    # Running as root (containers, CI) is the case where Chromium's sandbox
+    # refuses to start; as a normal user it works and should stay on.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        args.append("--no-sandbox")
+    return args
+
+
 async def human_delay(low: float = 0.5, high: float = 2.0) -> None:
     """Pause for a random interval, so interactions are not perfectly timed."""
     await asyncio.sleep(random.uniform(low, high))
@@ -61,13 +84,12 @@ async def human_delay(low: float = 0.5, high: float = 2.0) -> None:
 async def browser_page(headless: bool):
     """Yield a stealth-patched page and its context, closing the browser after."""
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=headless,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
+        browser = await playwright.chromium.launch(headless=headless, args=launch_args())
         try:
             context = await browser.new_context(
-                user_agent=USER_AGENT, viewport=VIEWPORT, locale=LOCALE
+                user_agent=chrome_user_agent(browser.version),
+                viewport=VIEWPORT,
+                locale=LOCALE,
             )
             page = await context.new_page()
             await Stealth().apply_stealth_async(page)
@@ -75,7 +97,7 @@ async def browser_page(headless: bool):
         finally:
             try:
                 await browser.close()
-            except Exception:  # the browser may already be gone
+            except PlaywrightError:  # the browser may already be gone
                 pass
 
 
@@ -100,9 +122,7 @@ async def dismiss_cookie_banner(page: Page) -> None:
                 await button.click()
                 await human_delay(0.5, 1.0)
                 return
-        except PlaywrightTimeout:
-            continue
-        except Exception:
+        except PlaywrightError:
             continue
 
 
@@ -112,9 +132,7 @@ async def raise_if_bot_check(page: Page) -> None:
         try:
             if await page.locator(selector).count() > 0:
                 raise ScrapeError(BOT_CHECK_MESSAGE)
-        except ScrapeError:
-            raise
-        except Exception:
+        except PlaywrightError:
             continue
 
 
@@ -122,7 +140,8 @@ async def open_reviews_section(page: Page) -> bool:
     """Click "Read all reviews" to load the full review list.
 
     This click is what triggers the ReviewList GraphQL request the fast mode
-    intercepts, so it runs in both modes. Returns whether a button was found.
+    intercepts, so it runs in both modes. Returns whether a button was found;
+    a False means every known selector is stale.
     """
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
     await human_delay(1.0, 2.0)
@@ -134,14 +153,27 @@ async def open_reviews_section(page: Page) -> bool:
                 await button.click()
                 await human_delay(2.0, 3.0)
                 return True
-        except Exception:
+        except PlaywrightError:
             continue
     return False
 
 
-async def save_debug_snapshot(page: Page, directory: Path) -> Path:
+async def wait_until(condition, timeout_s: float, interval_s: float = 0.25) -> bool:
+    """Poll `condition` until it is true or the timeout expires."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        if condition():
+            return True
+        await asyncio.sleep(interval_s)
+    return bool(condition())
+
+
+async def save_debug_snapshot(page: Page, directory: Path) -> list[Path]:
     """Write a screenshot and HTML dump for diagnosing selector breakage."""
     directory.mkdir(parents=True, exist_ok=True)
-    await page.screenshot(path=str(directory / "debug_reviews.png"), full_page=True)
-    (directory / "debug_reviews.html").write_text(await page.content(), encoding="utf-8")
-    return directory
+    screenshot = directory / "debug_reviews.png"
+    html = directory / "debug_reviews.html"
+    await page.screenshot(path=str(screenshot), full_page=True)
+    html.write_text(await page.content(), encoding="utf-8")
+    return [screenshot, html]

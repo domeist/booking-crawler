@@ -1,3 +1,5 @@
+"""The fast path: request replay, pagination and GraphQL card mapping."""
+
 import asyncio
 
 import httpx
@@ -5,6 +7,7 @@ import pytest
 
 from booking_crawler.reviews_api import (
     ReviewListRequest,
+    detect_schema_drift,
     fetch_all_reviews,
     format_review_date,
     format_score,
@@ -14,6 +17,7 @@ from booking_crawler.reviews_api import (
 CARD = {
     "reviewScore": 10.0,
     "reviewedDate": 1759521176,
+    "reviewUrl": "2580844e87d67c50",
     "partnerReply": {"reply": "thank you very much"},
     "textDetails": {
         "positiveText": "Spotless clean.",
@@ -25,7 +29,6 @@ CARD = {
         "checkinDate": "2025-10-02",
         "numNights": 1,
     },
-    "reviewUrl": "2580844e87d67c50",
     "guestDetails": {
         "username": "Eric",
         "countryName": "United States",
@@ -34,9 +37,11 @@ CARD = {
 }
 
 
+# --- card mapping ----------------------------------------------------------
+
+
 def test_parse_review_card_maps_every_field():
-    review = parse_review_card(CARD)
-    assert review == {
+    assert parse_review_card(CARD) == {
         "review_id": "2580844e87d67c50",
         "reviewer": "Eric",
         "country": "United States",
@@ -53,8 +58,7 @@ def test_parse_review_card_maps_every_field():
 
 
 def test_parse_review_card_handles_anonymous_guest():
-    card = {**CARD, "guestDetails": {"anonymous": True, "countryCode": "de"}}
-    review = parse_review_card(card)
+    review = parse_review_card({**CARD, "guestDetails": {"anonymous": True, "countryCode": "de"}})
     assert review["reviewer"] == "Anonymous"
     assert review["country"] == "de"
 
@@ -93,10 +97,27 @@ def test_format_review_date(raw, expected):
 
 @pytest.mark.parametrize(
     "raw,expected",
-    [(10.0, "10"), (9.6, "9.6"), ({"score": 8.0}, "8"), (None, ""), ("n/a", "n/a")],
+    [(10.0, "10"), (9.6, "9.6"), ("8,5", "8.5"), (None, ""), ("n/a", "n/a")],
 )
 def test_format_score(raw, expected):
     assert format_score(raw) == expected
+
+
+# --- schema drift ----------------------------------------------------------
+
+
+def test_detect_schema_drift_names_the_field_that_moved():
+    renamed = {key: value for key, value in CARD.items() if key != "textDetails"}
+    assert detect_schema_drift([renamed]) == "textDetails"
+    assert detect_schema_drift([{**CARD, "reviewUrl": ""}]) == "reviewUrl"
+
+
+def test_detect_schema_drift_accepts_a_healthy_page():
+    assert detect_schema_drift([CARD, {"reviewScore": 8.0}]) is None
+    assert detect_schema_drift([]) is None
+
+
+# --- request replay --------------------------------------------------------
 
 
 def _request():
@@ -105,7 +126,7 @@ def _request():
         body={
             "operationName": "ReviewList",
             "query": "query ReviewList {}",
-            "variables": {"shouldShowPhotos": True, "input": {"hotelId": 1, "skip": 0, "limit": 25}},
+            "variables": {"shouldShowPhotos": True, "input": {"hotelId": 1, "skip": 0, "limit": 10}},
         },
         headers={
             "cookie": "session=secret",
@@ -118,10 +139,8 @@ def _request():
 
 
 def test_body_for_page_advances_skip_and_keeps_other_variables():
-    body = _request().body_for_page(50)
-    assert body["variables"]["input"]["skip"] == 50
-    assert body["variables"]["input"]["limit"] == 25
-    assert body["variables"]["input"]["hotelId"] == 1
+    body = _request().body_for_page(50, limit=25)
+    assert body["variables"]["input"] == {"hotelId": 1, "skip": 50, "limit": 25}
     assert body["variables"]["shouldShowPhotos"] is True
     assert body["query"] == "query ReviewList {}"
 
@@ -133,18 +152,14 @@ def test_body_for_page_does_not_mutate_the_captured_request():
 
 
 def test_replay_headers_drops_connection_specific_headers():
-    headers = _request().replay_headers()
-    assert headers == {"x-booking-csrf-token": "token"}
+    assert _request().replay_headers() == {"x-booking-csrf-token": "token"}
 
 
 def test_page_size_defaults_when_missing():
-    request = ReviewListRequest(url="u", body={"variables": {"input": {}}})
-    assert request.page_size == 10
+    assert ReviewListRequest(url="u", body={"variables": {"input": {}}}).page_size == 10
 
 
-def test_body_for_page_accepts_a_larger_page_size():
-    body = _request().body_for_page(25, limit=25)
-    assert body["variables"]["input"] == {"hotelId": 1, "skip": 25, "limit": 25}
+# --- pagination ------------------------------------------------------------
 
 
 class _FakeResponse:
@@ -160,12 +175,22 @@ class _FakeResponse:
         return self._payload
 
 
-class _FakeClient:
-    """Serves queued responses and records which skips were requested."""
+def _card(index):
+    return {**CARD, "reviewUrl": f"id-{index}", "textDetails": {"positiveText": f"review {index}"}}
 
-    def __init__(self, responses):
-        self._responses = list(responses)
-        self.skips = []
+
+def _payload(cards, total):
+    return {"data": {"reviewListFrontend": {"reviewsCount": total, "reviewCard": cards}}}
+
+
+class _FakeServer:
+    """Serves `total` reviews, honouring skip and clamping limit like a real API."""
+
+    def __init__(self, total, max_limit=None, failures=()):
+        self.total = total
+        self.max_limit = max_limit
+        self.failures = list(failures)
+        self.requests = []
 
     async def __aenter__(self):
         return self
@@ -174,66 +199,94 @@ class _FakeClient:
         return False
 
     async def post(self, url, json):
-        self.skips.append(json["variables"]["input"]["skip"])
-        return self._responses.pop(0) if self._responses else _FakeResponse()
+        variables = json["variables"]["input"]
+        skip, limit = variables["skip"], variables["limit"]
+        self.requests.append((skip, limit))
+        if self.failures:
+            failure = self.failures.pop(0)
+            if failure is not None:
+                return _FakeResponse(status_code=failure)
+        served = min(limit, self.max_limit or limit)
+        cards = [_card(index) for index in range(skip, min(skip + served, self.total))]
+        return _FakeResponse(_payload(cards, self.total))
 
 
-def _page(count, total, start=0):
-    return _FakeResponse(
-        {
-            "data": {
-                "reviewListFrontend": {
-                    "reviewsCount": total,
-                    "reviewCard": [
-                        {
-                            "reviewScore": 9.0,
-                            "textDetails": {"positiveText": f"review {start + index}"},
-                        }
-                        for index in range(count)
-                    ],
-                }
-            }
-        }
-    )
+class _QueuedServer(_FakeServer):
+    """Serves exactly the pages it is given, for the awkward cases."""
+
+    def __init__(self, pages):
+        super().__init__(total=0)
+        self.pages = list(pages)
+
+    async def post(self, url, json):
+        self.requests.append((json["variables"]["input"]["skip"], json["variables"]["input"]["limit"]))
+        return self.pages.pop(0) if self.pages else _FakeResponse(_payload([], 0))
 
 
-async def _collect(monkeypatch, responses, **kwargs):
-    """Run fetch_all_reviews against canned responses, without real sleeps."""
-    client = _FakeClient(responses)
-
+def _run(monkeypatch, server, **kwargs):
     async def no_sleep(_seconds):
         return None
 
     monkeypatch.setattr("booking_crawler.reviews_api.asyncio.sleep", no_sleep)
-    monkeypatch.setattr("booking_crawler.reviews_api.httpx.AsyncClient", lambda **_: client)
-    return await fetch_all_reviews(_request(), {}, **kwargs), client
+    monkeypatch.setattr("booking_crawler.reviews_api.httpx.AsyncClient", lambda **_: server)
+    return asyncio.run(fetch_all_reviews(_request(), {}, **kwargs))
 
 
-def test_fetch_stops_once_every_review_is_collected(monkeypatch):
-    reviews, client = asyncio.run(
-        _collect(monkeypatch, [_page(25, 30), _page(5, 30, start=25)])
-    )
+def test_collects_every_review_and_stops(monkeypatch):
+    server = _FakeServer(total=30)
+    reviews = _run(monkeypatch, server)
     assert len(reviews) == 30
-    assert client.skips == [0, 25]
+    assert server.requests == [(0, 25), (25, 25)]
 
 
-def test_fetch_retries_an_empty_page_before_giving_up(monkeypatch):
-    reviews, _ = asyncio.run(
-        _collect(monkeypatch, [_page(25, 50), _page(0, 50), _page(25, 50, start=25)])
+def test_loses_nothing_when_the_server_clamps_the_page_size(monkeypatch):
+    """The stride must follow what the server sent, not what we asked for."""
+    server = _FakeServer(total=100, max_limit=10)
+    reviews = _run(monkeypatch, server)
+    assert len(reviews) == 100
+    assert [skip for skip, _ in server.requests] == list(range(0, 100, 10))
+
+
+def test_retries_a_transient_empty_page_at_the_same_offset(monkeypatch):
+    server = _QueuedServer(
+        [
+            _FakeResponse(_payload([_card(index) for index in range(25)], 50)),
+            _FakeResponse(_payload([], 50)),
+            _FakeResponse(_payload([_card(index) for index in range(25, 50)], 50)),
+        ]
     )
+    reviews = _run(monkeypatch, server)
     assert len(reviews) == 50
+    assert [skip for skip, _ in server.requests] == [0, 25, 25]
 
 
-def test_fetch_keeps_what_it_collected_when_the_api_fails(monkeypatch):
+def test_does_not_retry_the_final_page_once_every_review_is_in(monkeypatch):
+    server = _FakeServer(total=25)
+    _run(monkeypatch, server)
+    assert len(server.requests) == 1
+
+
+def test_keeps_what_it_collected_when_the_api_fails(monkeypatch):
     errors = []
-    responses = [_page(25, 100), *[_FakeResponse(status_code=502) for _ in range(3)]]
-    reviews, _ = asyncio.run(_collect(monkeypatch, responses, on_error=errors.append))
+    server = _FakeServer(total=500, failures=[None, 502, 502, 502])
+    reviews = _run(monkeypatch, server, on_error=errors.append)
     assert len(reviews) == 25
     assert len(errors) == 1
 
 
-def test_fetch_deduplicates_reviews_repeated_across_pages(monkeypatch):
-    reviews, _ = asyncio.run(
-        _collect(monkeypatch, [_page(25, 100), _page(25, 100), _page(0, 100), _page(0, 100)])
-    )
-    assert len(reviews) == 25
+def test_reports_drift_and_returns_nothing_rather_than_blank_reviews(monkeypatch):
+    drifted = [
+        {"reviewScore": 9.0, "guestDetails": {"username": "Ann"}, "reviewUrl": "x"}
+        for _ in range(25)
+    ]
+    reported = []
+    server = _QueuedServer([_FakeResponse(_payload(drifted, 200))])
+    reviews = _run(monkeypatch, server, on_drift=reported.append)
+    assert reviews == []
+    assert reported == ["textDetails"]
+
+
+def test_deduplicates_reviews_repeated_across_pages(monkeypatch):
+    repeated = _FakeResponse(_payload([_card(index) for index in range(25)], 100))
+    server = _QueuedServer([repeated, repeated, repeated])
+    assert len(_run(monkeypatch, server)) == 25

@@ -8,8 +8,9 @@ is the primary source here and the DOM is only used to fill the gaps.
 import json
 import re
 
-from playwright.async_api import Page
+from playwright.async_api import Error as PlaywrightError, Page
 
+# Selectors verified against booking.com on 2026-09-19.
 _JSON_LD_SELECTOR = 'script[type="application/ld+json"]'
 _DESCRIPTION_SELECTOR = '[data-testid="property-description"]'
 _ADDRESS_SELECTOR = '[data-testid="PropertyHeaderAddressDesktop-wrapper"]'
@@ -20,8 +21,33 @@ _AMENITIES_SELECTOR = (
     '[data-testid="facility-list-item"]'
 )
 
-# "Guest House Shtaka (Hotel) (Albania) deals" -> "Guest House Shtaka"
-_H1_SUFFIX = re.compile(r"\s*\(([^()]+)\)\s*\(([^()]+)\)\s*deals\s*$", re.IGNORECASE)
+# "Guest House Shtaka (Hotel) (Albania) deals" -> "Guest House Shtaka".
+# The country half is optional; some headings carry only the property type.
+_H1_SUFFIX = re.compile(
+    r"\s*\(([^()]+)\)(?:\s*\(([^()]+)\))?\s*deals\s*$", re.IGNORECASE
+)
+
+# A property page carries several JSON-LD blocks (Organization, WebSite,
+# BreadcrumbList). Picking the wrong one titles the report "Booking.com".
+_LODGING_TYPES = frozenset(
+    {
+        "hotel",
+        "lodgingbusiness",
+        "bedandbreakfast",
+        "apartment",
+        "aparthotel",
+        "hostel",
+        "motel",
+        "resort",
+        "campground",
+        "guesthouse",
+        "vacationrental",
+        "house",
+    }
+)
+
+# Lines the score widget renders for screen readers, never a score label.
+_SCORE_LABEL_NOISE = re.compile(r"^(?:scored|rated)\b", re.IGNORECASE)
 
 
 def clean_property_name(heading: str) -> tuple[str, str]:
@@ -56,7 +82,12 @@ def parse_score_block(text: str) -> dict:
         if count and not result["review_count"]:
             result["review_count"] = re.sub(r"[^\d]", "", count.group(1))
         label = line.split("·")[0].strip()
-        if label and not result["score_label"] and not re.search(r"\d", label):
+        if (
+            label
+            and not result["score_label"]
+            and not re.search(r"\d", label)
+            and not _SCORE_LABEL_NOISE.match(label)
+        ):
             result["score_label"] = label
 
     return result
@@ -109,29 +140,51 @@ def metadata_from_json_ld(payload: dict) -> dict:
     return data
 
 
+# A block needs more than a name to be the property: a lodging @type, or an
+# address or rating. Otherwise a BreadcrumbList or Organization block wins and
+# every report comes out titled "Booking.com".
+MIN_JSON_LD_SCORE = 3
+
+
+def json_ld_score(payload: dict) -> int:
+    """Rank a JSON-LD block by how much it looks like the property itself."""
+    if not isinstance(payload, dict) or not payload.get("name"):
+        return 0
+    score = 1
+    if str(payload.get("@type", "")).lower() in _LODGING_TYPES:
+        score += 4
+    if isinstance(payload.get("aggregateRating"), dict):
+        score += 2
+    if payload.get("address"):
+        score += 2
+    return score
+
+
 async def _read_json_ld(page: Page) -> dict:
-    """Return the first JSON-LD block that describes the property."""
+    """Return the JSON-LD block that best describes the property."""
     try:
         blocks = await page.locator(_JSON_LD_SELECTOR).all()
-    except Exception:
+    except PlaywrightError:
         return {}
 
+    best, best_score = None, MIN_JSON_LD_SCORE - 1
     for block in blocks:
         try:
             payload = json.loads(await block.inner_text(timeout=2000))
-        except Exception:
+        except (PlaywrightError, json.JSONDecodeError):
             continue
-        candidates = payload if isinstance(payload, list) else [payload]
-        for candidate in candidates:
-            if isinstance(candidate, dict) and candidate.get("name"):
-                return metadata_from_json_ld(candidate)
-    return {}
+        for candidate in payload if isinstance(payload, list) else [payload]:
+            score = json_ld_score(candidate)
+            if score > best_score:
+                best, best_score = candidate, score
+
+    return metadata_from_json_ld(best) if best else {}
 
 
 async def _text(page: Page, selector: str, timeout: int = 3000) -> str:
     try:
         return (await page.locator(selector).first.inner_text(timeout=timeout)).strip()
-    except Exception:
+    except PlaywrightError:
         return ""
 
 
@@ -140,13 +193,13 @@ async def _category_scores(page: Page) -> dict:
     scores = {}
     try:
         blocks = await page.locator(_SUBSCORE_SELECTOR).all()
-    except Exception:
+    except PlaywrightError:
         return scores
 
     for block in blocks:
         try:
             parsed = parse_subscore(await block.inner_text(timeout=2000))
-        except Exception:
+        except PlaywrightError:
             continue
         if parsed:
             scores[parsed[0]] = parsed[1]
@@ -157,13 +210,13 @@ async def _amenities(page: Page) -> list[str]:
     amenities = []
     try:
         items = await page.locator(_AMENITIES_SELECTOR).all()
-    except Exception:
+    except PlaywrightError:
         return amenities
 
     for item in items:
         try:
             text = (await item.inner_text(timeout=1000)).strip()
-        except Exception:
+        except PlaywrightError:
             continue
         if text:
             amenities.append(text)

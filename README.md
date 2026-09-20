@@ -6,9 +6,18 @@ other AI) and ask it what the guests actually think.
 
 ```
 $ python crawl.py "https://www.booking.com/hotel/al/guest-house-shtaka.en-gb.html"
+───────────────────────────── booking-crawler ─────────────────────────────
+Launching browser
+Loading property page
+Reading property details
 Property: Guest House Shtaka
+Opening reviews
 Fetching reviews from the review API
+  25 of 79 reviews
+  50 of 79 reviews
+  75 of 79 reviews
   79 of 79 reviews
+───────────────────────────────────────────────────────────────────────────
 Done. 79 reviews scraped.
 Report saved to results/guest-house-shtaka.txt
 ```
@@ -46,9 +55,14 @@ python crawl.py <url> --mode standard
 
 # Save a screenshot and HTML dump for debugging a failed scrape
 python crawl.py <url> --debug
+
+# Show the full traceback instead of a one-line error, for bug reports
+python crawl.py <url> --traceback
 ```
 
-Reports are written to `results/<property-name>.txt`, which is gitignored.
+Reports are written to `results/<property-name>.txt`, which is gitignored. A property whose
+name has no Latin characters is named after its URL instead, so two of them cannot overwrite
+each other.
 
 Installing the package (`pip install .`) also gives you a `booking-crawler` command that takes
 the same arguments.
@@ -133,10 +147,13 @@ booking_crawler/
     reviews_dom.py              standard mode: parse review cards, click through pages
     report.py                   text report formatting
     models.py                   the review shape and deduplication
-tests/                          unit tests for the parsing and formatting logic
+tests/                          unit tests; fakes.py stubs the Playwright objects
 ```
 
-Run the tests with `pip install -e ".[dev]"` then `pytest`.
+Run the tests with `pip install -e ".[dev]"` then `pytest`. They cover the parsing,
+pagination and formatting logic against stubbed pages and a fake review API — no browser and
+no network, so the suite finishes in well under a second. GitHub Actions runs it on 3.10,
+3.12 and 3.13.
 
 ## When it breaks
 
@@ -147,14 +164,19 @@ Run the tests with `pip install -e ".[dev]"` then `pytest`.
   Review cards are matched on `data-testid` attributes, which are not: if reviews stop
   coming back, run with `--debug` and compare `results/debug_reviews.html` against the
   selectors in `reviews_dom.py`.
-- **GraphQL schema changes.** If the `ReviewList` response shape changes, fast mode falls
-  back to standard mode on its own; the field mapping lives in
-  `reviews_api.parse_review_card`.
+- **GraphQL schema changes.** If a field the reviews depend on disappears from the response,
+  fast mode says which one and reads the page instead, rather than reporting a run full of
+  blank reviews. The field mapping lives in `reviews_api.parse_review_card`.
+- **Short scrapes.** If booking.com stops returning results part-way, the reviews collected
+  so far are still written out and the run says how many are missing.
 
 ## Legal and ethical use
 
 For personal research on publicly visible review data. Read Booking.com's Terms of Service
 before using it. Don't use it for commercial data harvesting or bulk scraping.
+
+Reports contain other people's names, countries and written reviews. That is personal data:
+keep the files to yourself, and don't republish them.
 
 ## Licence
 

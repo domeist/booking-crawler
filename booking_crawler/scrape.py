@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 from . import reviews_api, reviews_dom
 from .browser import (
@@ -10,13 +11,30 @@ from .browser import (
     open_reviews_section,
     raise_if_bot_check,
     save_debug_snapshot,
+    wait_until,
 )
 from .errors import ScrapeError
 from .metadata import extract_metadata
+from .report import clean_url
 
 MODE_FAST = "fast"
 MODE_STANDARD = "standard"
 MODES = (MODE_FAST, MODE_STANDARD)
+
+# How long to keep watching for the review API request after the click. The
+# response is what carries the reviews, and a throttled connection can take
+# several seconds to produce it.
+CAPTURE_TIMEOUT_S = 10.0
+
+
+class Reporter(Protocol):
+    """Where progress goes. The CLI prints it; the library ignores it."""
+
+    def status(self, message: str) -> None: ...
+
+    def progress(self, collected: int, total: int | None) -> None: ...
+
+    def warn(self, message: str) -> None: ...
 
 
 class _NullReporter:
@@ -32,7 +50,7 @@ class _NullReporter:
         pass
 
 
-def _warn_if_incomplete(reporter, reviews: list, metadata: dict) -> None:
+def _warn_if_incomplete(reporter: Reporter, reviews: list, metadata: dict) -> None:
     """Say so when fewer reviews came back than the property claims to have."""
     try:
         expected = int(metadata.get("review_count") or 0)
@@ -52,12 +70,13 @@ async def scrape(
     headless: bool = False,
     debug: bool = False,
     debug_dir: Path | None = None,
-    reporter=None,
+    reporter: Reporter | None = None,
 ) -> dict:
     """Scrape a property page and return its metadata and reviews.
 
     In fast mode the review API request is intercepted and replayed directly;
-    if that interception fails, the DOM click-loop runs instead.
+    if that interception fails, or the API's schema has moved, the reviews are
+    read from the page instead.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
@@ -74,18 +93,23 @@ async def scrape(
         reporter.status(f"Property: {metadata.get('name') or 'unknown'}")
 
         reporter.status("Opening reviews")
+        captured = []
         if mode == MODE_FAST:
             async with reviews_api.intercept_review_list(page) as captured:
-                await open_reviews_section(page)
+                found_button = await open_reviews_section(page)
+                await wait_until(lambda: bool(captured), CAPTURE_TIMEOUT_S)
         else:
-            captured = []
-            await open_reviews_section(page)
+            found_button = await open_reviews_section(page)
 
+        if not found_button:
+            reporter.warn(
+                "Could not find the 'Read all reviews' button — its selectors may be stale."
+            )
         await raise_if_bot_check(page)
 
         if debug:
-            snapshot = await save_debug_snapshot(page, debug_dir or Path("results"))
-            reporter.status(f"Debug snapshot written to {snapshot}")
+            written = await save_debug_snapshot(page, debug_dir or Path("results"))
+            reporter.status("Debug snapshot: " + ", ".join(str(path) for path in written))
 
         reviews = []
         if captured:
@@ -96,10 +120,12 @@ async def scrape(
                 cookies,
                 on_progress=reporter.progress,
                 on_error=lambda exc: reporter.warn(f"Review API stopped responding: {exc}"),
+                on_drift=lambda field: reporter.warn(
+                    f"The review API no longer returns '{field}' — reading the page instead."
+                ),
             )
-            _warn_if_incomplete(reporter, reviews, metadata)
         elif mode == MODE_FAST:
-            reporter.warn("Could not intercept the review API — falling back to the page")
+            reporter.warn("Could not intercept the review API — reading the page instead")
 
         if not reviews:
             reporter.status("Reading reviews from the page")
@@ -110,9 +136,12 @@ async def scrape(
             "No reviews found. The property may have none, or booking.com's "
             "page structure changed — re-run with --debug and check the snapshot."
         )
+    _warn_if_incomplete(reporter, reviews, metadata)
 
     return {
-        "url": url,
+        # Stripped here as well as in the report: the query string carries a
+        # session id, and library callers write their own output.
+        "url": clean_url(url),
         "scraped_at": datetime.now().isoformat(timespec="seconds"),
         "metadata": metadata,
         "reviews": reviews,

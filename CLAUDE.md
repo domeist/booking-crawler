@@ -25,6 +25,20 @@ an AI to summarise. See README.md for usage; this file records the non-obvious c
 - **Review dates from the API are Unix timestamps**, and the guest's name is
   `guestDetails.username` — not `displayName`, which does not exist and silently yielded
   empty names.
+- **Advance `skip` by the number of cards returned, never by the requested limit.** The code
+  asks for 25 while the page asks for 10; if booking.com ever clamps it, a fixed stride
+  silently skips reviews. `tests/test_reviews_api.py` has a fake server that clamps, which
+  fails if this regresses.
+- **A JSON-LD block needs more than a `name` to be the property.** Pages carry Organization
+  and BreadcrumbList blocks too; picking the first one with a name titles every report
+  "Booking.com". `json_ld_score` scores candidates and `MIN_JSON_LD_SCORE` rejects the rest.
+- **Partial schema drift is worse than total drift.** If a renamed field leaves the rest
+  intact, reviews parse into blanks and a run "succeeds". `detect_schema_drift` checks the
+  first page for the fields the mapping needs and falls back to reading the page.
+- **`--no-sandbox` is only for root.** Chromium's sandbox works fine as a normal user
+  (verified 2026-09-19); passing the flag unconditionally disabled it for no reason.
+  The user agent is built from the running browser's version — a UA that contradicts the
+  engine is itself a bot signal.
 - **Reports must not contain the URL's query string.** Booking.com URLs carry a `sid`
   session identifier; the whole point of the report is to share it. `report.clean_url`
   handles this — keep it that way.
@@ -37,6 +51,8 @@ same property in quick succession will start returning challenge pages; back off
 
 ## Testing
 
-`pytest` covers the parsing and formatting logic (pure functions only — no network). The
-scraping paths need a live page, so verify changes to `reviews_api.py` or `reviews_dom.py`
-with a real run in both modes.
+`pytest` covers parsing, pagination and formatting with no browser and no network:
+`tests/fakes.py` stubs the handful of Playwright calls the extractors make, and
+`tests/test_reviews_api.py` has a fake review API that honours `skip`, clamps `limit` and
+fails on demand. Selector and schema changes still need a live check, so verify edits to
+`reviews_api.py` or `reviews_dom.py` with a real run in both modes.

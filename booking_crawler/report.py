@@ -19,10 +19,27 @@ def clean_url(url: str) -> str:
 
 
 def slug(name: str) -> str:
-    """Convert a property name into a filesystem-safe slug."""
+    """Convert a property name into a filesystem-safe slug.
+
+    Returns "" when nothing survives transliteration, which is the normal case
+    for a name written entirely in a non-Latin script — the caller then has to
+    find a name elsewhere rather than writing every such property to the same
+    file.
+    """
     decomposed = unicodedata.normalize("NFKD", name or "")
     ascii_name = decomposed.encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-") or "property"
+    return re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-")
+
+
+def slug_from_url(url: str) -> str:
+    """Derive a slug from a booking.com URL: .../hotel/al/guest-house.en-gb.html."""
+    filename = urlsplit(url or "").path.rstrip("/").rsplit("/", 1)[-1]
+    return slug(filename.split(".")[0])
+
+
+def report_name(property_name: str, url: str = "") -> str:
+    """The base filename for a report, falling back through name then URL."""
+    return slug(property_name) or slug_from_url(url) or "property"
 
 
 def _metadata_lines(metadata: dict) -> list[str]:
@@ -58,11 +75,13 @@ def _review_lines(review: dict, number: int) -> list[str]:
     lines = ["", f"--- Review {number} ---"]
 
     byline = [review.get(field) for field in ("reviewer", "country", "date")]
-    if byline := [part for part in byline if part]:
+    byline = [part for part in byline if part]
+    if byline:
         lines.append(", ".join(byline))
 
     context = [review.get(field) for field in ("traveller_type", "room", "stay")]
-    if context := [part for part in context if part]:
+    context = [part for part in context if part]
+    if context:
         lines.append(f"Stay: {' | '.join(context)}")
 
     if score := review.get("score"):

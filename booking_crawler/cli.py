@@ -4,19 +4,22 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from rich.console import Console
 from rich.rule import Rule
 
+from . import __version__
 from .errors import ScrapeError
-from .report import format_report, slug
+from .report import format_report, report_name
 from .scrape import MODE_FAST, MODE_STANDARD, MODES, scrape
 
 DEFAULT_OUTPUT_DIR = Path("results")
+BOOKING_HOST_SUFFIX = "booking.com"
 
 
 class ConsoleReporter:
-    """Prints scrape progress, rewriting the review count in place."""
+    """Prints scrape progress, one line per batch of reviews."""
 
     def __init__(self, console: Console):
         self._console = console
@@ -29,11 +32,20 @@ class ConsoleReporter:
         self._console.print(f"[yellow]{message}[/yellow]")
 
     def progress(self, collected: int, total: int | None) -> None:
-        if collected == self._last_progress:
+        if collected == self._last_progress or collected == 0:
             return
         self._last_progress = collected
         suffix = f" of {total}" if total else ""
         self._console.print(f"  [dim]{collected}{suffix} reviews[/dim]")
+
+
+def is_booking_url(url: str) -> bool:
+    """Whether this is an http(s) URL on booking.com itself."""
+    parts = urlsplit(url or "")
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = parts.hostname or ""
+    return host == BOOKING_HOST_SUFFIX or host.endswith("." + BOOKING_HOST_SUFFIX)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,11 +80,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Save a screenshot and HTML dump of the review page",
     )
+    parser.add_argument(
+        "--traceback",
+        action="store_true",
+        help="Show the full traceback when something goes wrong, for bug reports",
+    )
+    parser.add_argument("--version", action="version", version=f"booking-crawler {__version__}")
     return parser
 
 
-def _output_path(explicit: Path | None, property_name: str) -> Path:
-    path = explicit or DEFAULT_OUTPUT_DIR / f"{slug(property_name)}.txt"
+def _output_path(explicit: Path | None, property_name: str, url: str) -> Path:
+    path = explicit or DEFAULT_OUTPUT_DIR / f"{report_name(property_name, url)}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -81,8 +99,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     console = Console()
 
-    if "booking.com" not in args.url:
-        console.print("[bold red]Error:[/bold red] URL must be a booking.com property page.")
+    if not is_booking_url(args.url):
+        console.print(
+            "[bold red]Error:[/bold red] URL must be a booking.com property page, "
+            "for example https://www.booking.com/hotel/gb/example.html"
+        )
         return 2
 
     console.print(Rule("[bold]booking-crawler[/bold]"))
@@ -94,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.mode,
                 headless=args.headless,
                 debug=args.debug,
+                debug_dir=(args.output.parent if args.output else None),
                 reporter=ConsoleReporter(console),
             )
         )
@@ -103,12 +125,15 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         return 130
-    except Exception as exc:  # noqa: BLE001 - a traceback helps nobody here
+    except Exception as exc:  # noqa: BLE001 - a bare traceback helps nobody here
+        if args.traceback:
+            raise
         console.print(f"[bold red]Unexpected error:[/bold red] {type(exc).__name__}: {exc}")
-        console.print("[dim]Re-run with --debug to capture the page for inspection.[/dim]")
+        console.print("[dim]Re-run with --traceback for the full error, or --debug "
+                      "to capture the page.[/dim]")
         return 1
 
-    output_path = _output_path(args.output, data["metadata"].get("name") or "property")
+    output_path = _output_path(args.output, data["metadata"].get("name") or "", args.url)
     output_path.write_text(format_report(data), encoding="utf-8")
 
     console.print(Rule())

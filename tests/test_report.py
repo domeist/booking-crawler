@@ -1,4 +1,6 @@
-from booking_crawler.report import clean_url, format_report, slug
+"""Report rendering and output naming."""
+
+from booking_crawler.report import clean_url, format_report, report_name, slug, slug_from_url
 
 
 def test_clean_url_strips_session_and_tracking_parameters():
@@ -17,9 +19,28 @@ def test_slug_transliterates_accents():
     assert slug("Hôtel Ámsterdam") == "hotel-amsterdam"
 
 
-def test_slug_falls_back_when_nothing_usable_remains():
-    assert slug("...") == "property"
-    assert slug("") == "property"
+def test_slug_is_empty_when_no_latin_characters_survive():
+    assert slug("北京饭店") == ""
+    assert slug("Гостиница Москва") == ""
+    assert slug("...") == ""
+
+
+def test_slug_cannot_escape_the_output_directory():
+    assert slug("../../etc/passwd") == "etc-passwd"
+
+
+def test_slug_from_url_uses_the_property_segment():
+    assert slug_from_url("https://www.booking.com/hotel/al/guest-house.en-gb.html?sid=1") == (
+        "guest-house"
+    )
+    assert slug_from_url("") == ""
+
+
+def test_report_name_prefers_the_name_then_the_url():
+    url = "https://www.booking.com/hotel/ru/moskva.html"
+    assert report_name("Grand Hotel", url) == "grand-hotel"
+    assert report_name("Гостиница Москва", url) == "moskva"
+    assert report_name("", "") == "property"
 
 
 def _report(**overrides):
@@ -76,14 +97,17 @@ def test_report_never_leaks_the_session_id():
 
 
 def test_report_omits_fields_that_are_missing():
-    text = _report(
-        metadata={"name": "Tiny Inn"},
-        reviews=[{"score": "8", "pros": "Fine"}],
-    )
+    text = _report(metadata={"name": "Tiny Inn"}, reviews=[{"score": "8", "pros": "Fine"}])
     assert "Address:" not in text
     assert "Score breakdown:" not in text
     assert "Disliked:" not in text
     assert "Score: 8" in text
+
+
+def test_report_numbers_reviews_in_order():
+    text = _report(reviews=[{"pros": "One"}, {"pros": "Two"}, {"pros": "Three"}])
+    assert "--- Review 1 ---" in text and "--- Review 3 ---" in text
+    assert text.index("One") < text.index("Two") < text.index("Three")
 
 
 def test_report_handles_zero_reviews():
