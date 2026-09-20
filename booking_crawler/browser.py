@@ -9,9 +9,13 @@ from pathlib import Path
 
 from playwright.async_api import (
     Error as PlaywrightError,
+)
+from playwright.async_api import (
     Page,
-    TimeoutError as PlaywrightTimeout,
     async_playwright,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeout,
 )
 from playwright_stealth import Stealth
 

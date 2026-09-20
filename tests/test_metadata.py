@@ -1,7 +1,9 @@
 """Pure parsers behind property metadata extraction."""
 
 from booking_crawler.metadata import (
+    MIN_JSON_LD_SCORE,
     clean_property_name,
+    json_ld_score,
     metadata_from_json_ld,
     parse_score_block,
     parse_subscore,
@@ -70,3 +72,32 @@ def test_metadata_from_json_ld_extracts_the_fields_we_report():
 def test_metadata_from_json_ld_builds_an_address_without_a_street():
     payload = {"address": {"addressLocality": "Gjirokaster", "addressCountry": "Albania"}}
     assert metadata_from_json_ld(payload)["address"] == "Gjirokaster, Albania"
+
+
+def test_a_type_given_as_a_list_still_identifies_the_property():
+    """Schema.org allows @type to be an array; a stringified list is not a type."""
+    payload = {"@type": ["LocalBusiness", "Hotel"], "name": "X", "aggregateRating": {"r": 1}}
+    assert metadata_from_json_ld(payload)["property_type"] == "Hotel"
+    assert json_ld_score(payload) >= MIN_JSON_LD_SCORE
+
+
+def test_an_organisation_block_with_an_address_does_not_qualify():
+    """Booking.com's own corporate block has a name and an address."""
+    payload = {"@type": "Organization", "name": "Booking.com", "address": {"streetAddress": "1 St"}}
+    assert json_ld_score(payload) < MIN_JSON_LD_SCORE
+
+
+def test_a_lodging_block_or_a_rated_block_qualifies():
+    assert json_ld_score({"@type": "Hotel", "name": "X"}) >= MIN_JSON_LD_SCORE
+    assert json_ld_score({"@type": "Place", "name": "X", "aggregateRating": {"r": 1}}) >= (
+        MIN_JSON_LD_SCORE
+    )
+
+
+def test_a_plain_text_address_is_kept():
+    payload = {"@type": "Hotel", "name": "Y", "address": "12 High St, London"}
+    assert metadata_from_json_ld(payload)["address"] == "12 High St, London"
+
+
+def test_a_block_without_a_name_is_never_chosen():
+    assert json_ld_score({"@type": "Hotel", "aggregateRating": {"r": 1}}) == 0

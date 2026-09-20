@@ -40,7 +40,7 @@ _DROPPED_HEADERS = frozenset({"host", "content-length", "accept-encoding", "cook
 
 # The response fields parse_review_card maps. If a whole page lacks one, the
 # schema has moved and the reviews would parse into blanks.
-_REQUIRED_CARD_FIELDS = ("textDetails", "guestDetails", "reviewUrl")
+_REQUIRED_CARD_FIELDS = ("textDetails", "guestDetails", "reviewUrl", "reviewScore")
 
 
 @dataclass
@@ -124,20 +124,29 @@ def format_review_date(raw) -> str:
 
 
 def format_score(raw) -> str:
-    """Render a score without a trailing .0, so 10.0 prints as 10."""
+    """Render a score without a trailing .0, so 10.0 prints as 10.
+
+    Older responses wrapped the score in an object, so that shape is unwrapped
+    rather than stringified — a repr in the report would be worse than a blank.
+    """
+    if isinstance(raw, dict):
+        raw = raw.get("score", "")
     if raw in (None, ""):
         return ""
     try:
         value = float(str(raw).replace(",", "."))
     except (TypeError, ValueError):
-        return str(raw)
+        return ""
     return str(int(value)) if value.is_integer() else f"{value:g}"
 
 
 def _format_stay(booking: dict) -> str:
     """Summarise the stay as "2 nights, October 2025"."""
     parts = []
-    nights = booking.get("numNights")
+    try:
+        nights = int(booking.get("numNights") or 0)
+    except (TypeError, ValueError):
+        nights = 0
     if nights:
         parts.append(f"{nights} night" if nights == 1 else f"{nights} nights")
 
@@ -203,13 +212,15 @@ def _cards_from_response(payload: dict) -> tuple[list[dict], int | None]:
     return (cards if isinstance(cards, list) else []), (total if isinstance(total, int) else None)
 
 
-async def _fetch_page(client, request: ReviewListRequest, skip: int, page_size: int, *, retry_empty: bool):
+async def _fetch_page(
+    client, request: ReviewListRequest, skip: int, page_size: int, *, retry_empty: bool
+):
     """Fetch one page, retrying transient failures.
 
     Returns (cards, total, error). A failure is returned rather than raised so
     that an error near the end of a long scrape keeps the reviews already
-    collected instead of discarding them. `retry_empty` is False once every
-    review is accounted for, so the last page is not re-requested three times.
+    collected instead of discarding them. `retry_empty` is False once the list
+    is known to be exhausted, so the page past the end is asked for once.
     """
     error = None
     for attempt in range(PAGE_ATTEMPTS):
@@ -252,6 +263,7 @@ async def fetch_all_reviews(
     # A review added mid-scrape shifts the pages, so one page of pure
     # duplicates is not the end of the list — two in a row is.
     duplicate_pages = 0
+    last_page_was_full = True
 
     async with httpx.AsyncClient(
         cookies=cookies,
@@ -263,9 +275,12 @@ async def fetch_all_reviews(
             if on_progress:
                 on_progress(len(reviews), total)
 
-            expecting_more = total is None or len(reviews) < total
+            # A short page means the list ran out, so an empty page after it is
+            # the end rather than a hiccup worth retrying. Without this the
+            # final request is made three times, 4.5s of backoff, on every run
+            # where the API does not report a total.
             cards, reported_total, error = await _fetch_page(
-                client, request, skip, page_size, retry_empty=expecting_more
+                client, request, skip, page_size, retry_empty=last_page_was_full
             )
             if error is not None:
                 if on_error:
@@ -289,6 +304,7 @@ async def fetch_all_reviews(
             # Advance by what the server actually sent, not by what was asked
             # for: a clamped limit then costs extra requests, not reviews.
             skip += len(cards)
+            last_page_was_full = len(cards) >= page_size
 
             duplicate_pages = 0 if fresh else duplicate_pages + 1
             if not cards or duplicate_pages >= 2:

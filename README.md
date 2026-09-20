@@ -118,7 +118,7 @@ cookie banner is dismissed, property details are read from the page's JSON-LD bl
 
 **Fast mode (default).** Clicking "Read all reviews" fires a `ReviewList` GraphQL request.
 That request is intercepted, and its URL, headers, cookies and query are replayed directly
-with `httpx`, 25 reviews at a time, until the property's review count is reached. No
+with `httpx`, 25 reviews per request, until the property's review count is reached. No
 rendering and no clicking, so a property with 79 reviews finishes in about 25 seconds
 where standard mode needs four minutes.
 
@@ -140,7 +140,8 @@ Fast mode falls back to it automatically if interception fails.
 crawl.py                        CLI entry point
 booking_crawler/
     cli.py                      argument parsing, console output
-    scrape.py                   orchestration, mode selection, fallback
+    scraper.py                  orchestration, mode selection, fallback
+    errors.py                   the one exception type the CLI catches
     browser.py                  browser launch, cookie banner, bot-check detection
     metadata.py                 property details (JSON-LD first, DOM to fill gaps)
     reviews_api.py              fast mode: intercept and replay the review API
@@ -157,6 +158,9 @@ no network, so the suite finishes in well under a second. GitHub Actions runs it
 
 ## When it breaks
 
+- **English URLs.** Property pages are opened in `en-GB`, and dates and property types are
+  parsed as English. A `.fr.html` or `.de.html` URL still scrapes, but those fields come back
+  raw or empty.
 - **Bot check.** Booking.com detects automation. Running with a visible browser (the
   default) is noticeably more reliable than `--headless`. If a challenge page appears the
   scraper stops and says so — solve it in the window and re-run.

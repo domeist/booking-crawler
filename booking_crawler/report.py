@@ -1,10 +1,23 @@
 """Turn scraped data into the plain-text report users upload to an AI."""
 
+import os
 import re
 import unicodedata
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 SEPARATOR = "=" * 60
+
+
+def write_report(path: Path, text: str) -> None:
+    """Write a report, replacing the old one only once the new one is complete.
+
+    A scrape costs minutes, so a failure here must not leave the previous
+    report half-overwritten.
+    """
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def clean_url(url: str) -> str:

@@ -76,9 +76,13 @@ def test_parse_review_card_rejects_empty_cards():
     assert parse_review_card("not a card") is None
 
 
-def test_parse_review_card_pluralises_nights():
-    card = {**CARD, "bookingDetails": {"numNights": 3, "checkinDate": "2025-10-02"}}
-    assert parse_review_card(card)["stay"] == "3 nights, October 2025"
+@pytest.mark.parametrize(
+    "nights,expected",
+    [(1, "1 night, October 2025"), ("1", "1 night, October 2025"), (3, "3 nights, October 2025")],
+)
+def test_parse_review_card_pluralises_nights(nights, expected):
+    card = {**CARD, "bookingDetails": {"numNights": nights, "checkinDate": "2025-10-02"}}
+    assert parse_review_card(card)["stay"] == expected
 
 
 @pytest.mark.parametrize(
@@ -97,7 +101,15 @@ def test_format_review_date(raw, expected):
 
 @pytest.mark.parametrize(
     "raw,expected",
-    [(10.0, "10"), (9.6, "9.6"), ("8,5", "8.5"), (None, ""), ("n/a", "n/a")],
+    [
+        (10.0, "10"),
+        (9.6, "9.6"),
+        ("8,5", "8.5"),
+        ({"score": 9.0}, "9"),  # the shape older responses used
+        ({}, ""),
+        (None, ""),
+        ("n/a", ""),  # a repr in the report would be worse than a blank
+    ],
 )
 def test_format_score(raw, expected):
     assert format_score(raw) == expected
@@ -106,10 +118,10 @@ def test_format_score(raw, expected):
 # --- schema drift ----------------------------------------------------------
 
 
-def test_detect_schema_drift_names_the_field_that_moved():
-    renamed = {key: value for key, value in CARD.items() if key != "textDetails"}
-    assert detect_schema_drift([renamed]) == "textDetails"
-    assert detect_schema_drift([{**CARD, "reviewUrl": ""}]) == "reviewUrl"
+@pytest.mark.parametrize("field", ["textDetails", "guestDetails", "reviewUrl", "reviewScore"])
+def test_detect_schema_drift_names_the_field_that_moved(field):
+    renamed = {key: value for key, value in CARD.items() if key != field}
+    assert detect_schema_drift([renamed]) == field
 
 
 def test_detect_schema_drift_accepts_a_healthy_page():
@@ -126,7 +138,10 @@ def _request():
         body={
             "operationName": "ReviewList",
             "query": "query ReviewList {}",
-            "variables": {"shouldShowPhotos": True, "input": {"hotelId": 1, "skip": 0, "limit": 10}},
+            "variables": {
+                "shouldShowPhotos": True,
+                "input": {"hotelId": 1, "skip": 0, "limit": 10},
+            },
         },
         headers={
             "cookie": "session=secret",
@@ -180,7 +195,11 @@ def _card(index):
 
 
 def _payload(cards, total):
-    return {"data": {"reviewListFrontend": {"reviewsCount": total, "reviewCard": cards}}}
+    """One API response. `total` of None mimics a response with no count."""
+    reviews = {"reviewCard": cards}
+    if total is not None:
+        reviews["reviewsCount"] = total
+    return {"data": {"reviewListFrontend": reviews}}
 
 
 class _FakeServer:
@@ -219,7 +238,8 @@ class _QueuedServer(_FakeServer):
         self.pages = list(pages)
 
     async def post(self, url, json):
-        self.requests.append((json["variables"]["input"]["skip"], json["variables"]["input"]["limit"]))
+        variables = json["variables"]["input"]
+        self.requests.append((variables["skip"], variables["limit"]))
         return self.pages.pop(0) if self.pages else _FakeResponse(_payload([], 0))
 
 
@@ -260,7 +280,36 @@ def test_retries_a_transient_empty_page_at_the_same_offset(monkeypatch):
     assert [skip for skip, _ in server.requests] == [0, 25, 25]
 
 
-def test_does_not_retry_the_final_page_once_every_review_is_in(monkeypatch):
+def test_asks_for_the_page_past_the_end_only_once(monkeypatch):
+    """A short page means the list ran out, so the empty page after it is final.
+
+    Without a count from the API this is the only signal that the end has been
+    reached, and retrying it three times costs 4.5s of backoff on every run.
+    """
+    server = _QueuedServer(
+        [
+            _FakeResponse(_payload([_card(index) for index in range(25)], None)),
+            _FakeResponse(_payload([_card(index) for index in range(25, 30)], None)),
+            _FakeResponse(_payload([], None)),
+        ]
+    )
+    reviews = _run(monkeypatch, server)
+    assert len(reviews) == 30
+    assert [skip for skip, _ in server.requests] == [0, 25, 30]
+
+
+def test_still_retries_an_empty_page_that_follows_a_full_one(monkeypatch):
+    server = _QueuedServer(
+        [
+            _FakeResponse(_payload([_card(index) for index in range(25)], None)),
+            _FakeResponse(_payload([], None)),
+            _FakeResponse(_payload([_card(index) for index in range(25, 50)], None)),
+        ]
+    )
+    assert len(_run(monkeypatch, server)) == 50
+
+
+def test_stops_without_extra_requests_when_the_count_is_reached(monkeypatch):
     server = _FakeServer(total=25)
     _run(monkeypatch, server)
     assert len(server.requests) == 1

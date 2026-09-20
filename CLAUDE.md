@@ -39,6 +39,12 @@ an AI to summarise. See README.md for usage; this file records the non-obvious c
   (verified 2026-09-19); passing the flag unconditionally disabled it for no reason.
   The user agent is built from the running browser's version — a UA that contradicts the
   engine is itself a bot signal.
+- **A JSON-LD `@type` may be a list.** `["LocalBusiness","Hotel"]` stringifies to a value that
+  matches no lodging type, which both loses the block's ranking and prints the list into the
+  report. Normalise before comparing.
+- **The report write belongs inside the CLI's error handler.** A scrape costs minutes; a bad
+  `--output` path must not discard it with a traceback. `write_report` also writes to a temp
+  file and renames, so a failure leaves the previous report intact.
 - **Reports must not contain the URL's query string.** Booking.com URLs carry a `sid`
   session identifier; the whole point of the report is to share it. `report.clean_url`
   handles this — keep it that way.

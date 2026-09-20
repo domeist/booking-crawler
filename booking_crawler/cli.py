@@ -11,8 +11,8 @@ from rich.rule import Rule
 
 from . import __version__
 from .errors import ScrapeError
-from .report import format_report, report_name
-from .scrape import MODE_FAST, MODE_STANDARD, MODES, scrape
+from .report import format_report, report_name, write_report
+from .scraper import MODE_FAST, MODE_STANDARD, MODES, scrape
 
 DEFAULT_OUTPUT_DIR = Path("results")
 BOOKING_HOST_SUFFIX = "booking.com"
@@ -119,22 +119,29 @@ def main(argv: list[str] | None = None) -> int:
                 reporter=ConsoleReporter(console),
             )
         )
+        # Inside the handler: a scrape costs minutes, and a bad --output path
+        # must not throw the result away with a traceback.
+        output_path = _output_path(args.output, data["metadata"].get("name") or "", args.url)
+        write_report(output_path, format_report(data))
     except ScrapeError as exc:
         console.print(f"[bold red]Scrape failed:[/bold red] {exc}")
+        return 1
+    except OSError as exc:
+        console.print(f"[bold red]Could not write the report:[/bold red] {exc}")
         return 1
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         return 130
-    except Exception as exc:  # noqa: BLE001 - a bare traceback helps nobody here
+    # Deliberately broad: a raw traceback helps nobody, and --traceback is the escape.
+    except Exception as exc:
         if args.traceback:
             raise
         console.print(f"[bold red]Unexpected error:[/bold red] {type(exc).__name__}: {exc}")
-        console.print("[dim]Re-run with --traceback for the full error, or --debug "
-                      "to capture the page.[/dim]")
+        console.print(
+            "[dim]Re-run with --traceback for the full error, or --debug "
+            "to capture the page.[/dim]"
+        )
         return 1
-
-    output_path = _output_path(args.output, data["metadata"].get("name") or "", args.url)
-    output_path.write_text(format_report(data), encoding="utf-8")
 
     console.print(Rule())
     console.print(f"[bold green]Done.[/bold green] {len(data['reviews'])} reviews scraped.")

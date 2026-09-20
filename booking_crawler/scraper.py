@@ -54,7 +54,7 @@ def _warn_if_incomplete(reporter: Reporter, reviews: list, metadata: dict) -> No
     """Say so when fewer reviews came back than the property claims to have."""
     try:
         expected = int(metadata.get("review_count") or 0)
-    except ValueError:
+    except (TypeError, ValueError):
         return
     if expected and len(reviews) < expected:
         reporter.warn(

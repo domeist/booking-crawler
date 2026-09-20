@@ -10,7 +10,11 @@ from datetime import datetime
 
 from playwright.async_api import (
     Error as PlaywrightError,
+)
+from playwright.async_api import (
     Page,
+)
+from playwright.async_api import (
     TimeoutError as PlaywrightTimeout,
 )
 
@@ -193,15 +197,19 @@ async def paginate_reviews(page: Page, *, on_progress=None) -> list[dict]:
 
     reviews: list[dict] = []
     seen: set[str] = set()
+    # As in the API path: one page of duplicates can mean the list shifted
+    # under us or simply has not re-rendered yet; two means the end.
+    duplicate_pages = 0
 
     for _ in range(MAX_REVIEW_PAGES):
         if on_progress:
             on_progress(len(reviews), None)
 
         fresh = deduplicate(await extract_cards_on_page(page), seen)
-        if not fresh:
-            break
         reviews.extend(fresh)
+        duplicate_pages = 0 if fresh else duplicate_pages + 1
+        if duplicate_pages >= 2:
+            break
 
         try:
             first_card = await page.locator(REVIEW_CARD_SELECTOR).first.inner_text(timeout=2000)

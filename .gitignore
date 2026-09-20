@@ -1,5 +1,6 @@
-# Output files — contain scraped data and personal URLs
+# Output files — contain other people's names and reviews
 results/
+reports/
 
 # Python
 __pycache__/

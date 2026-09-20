@@ -91,3 +91,16 @@ def test_missing_everything_yields_blank_fields_rather_than_an_error():
     assert metadata["name"] == ""
     assert metadata["category_scores"] == {}
     assert metadata["amenities"] == []
+
+
+def test_an_organisation_block_never_becomes_the_property():
+    """A corporate block with a name and an address must not win."""
+    corporate = {
+        "@type": "Organization",
+        "name": "Booking.com",
+        "address": {"streetAddress": "Oosterdokskade 163, Amsterdam"},
+    }
+    listed_type = {**PROPERTY_BLOCK, "@type": ["LocalBusiness", "Hotel"]}
+    metadata = asyncio.run(extract_metadata(_page([corporate, listed_type])))
+    assert metadata["name"] == "Guest House Shtaka"
+    assert metadata["property_type"] == "Hotel"

@@ -8,7 +8,8 @@ is the primary source here and the DOM is only used to fill the gaps.
 import json
 import re
 
-from playwright.async_api import Error as PlaywrightError, Page
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page
 
 # Selectors verified against booking.com on 2026-09-19.
 _JSON_LD_SELECTOR = 'script[type="application/ld+json"]'
@@ -108,27 +109,47 @@ def parse_subscore(text: str) -> tuple[str, str] | None:
     return category, score.replace(",", ".")
 
 
+def json_ld_types(payload: dict) -> list[str]:
+    """The block's @type values. Schema.org allows a single type or a list."""
+    raw = payload.get("@type") or []
+    values = raw if isinstance(raw, list) else [raw]
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def json_ld_address(payload: dict) -> str:
+    """The block's address, which may be a PostalAddress object or plain text."""
+    address = payload.get("address")
+    if isinstance(address, str):
+        return address.strip()
+    if not isinstance(address, dict):
+        return ""
+
+    street = address.get("streetAddress") or ""
+    if not street:
+        parts = [
+            address.get(key, "")
+            for key in ("addressLocality", "postalCode", "addressRegion", "addressCountry")
+        ]
+        street = ", ".join(part for part in parts if part)
+    return street.strip()
+
+
 def metadata_from_json_ld(payload: dict) -> dict:
     """Pull the fields we care about out of a JSON-LD property block."""
     data = {}
     if name := payload.get("name"):
         data["name"] = str(name).strip()
-    if property_type := payload.get("@type"):
-        data["property_type"] = str(property_type).strip()
     if description := payload.get("description"):
         data["description"] = str(description).strip()
 
-    address = payload.get("address")
-    if isinstance(address, dict):
-        street = address.get("streetAddress") or ""
-        if not street:
-            parts = [
-                address.get(key, "")
-                for key in ("addressLocality", "postalCode", "addressRegion", "addressCountry")
-            ]
-            street = ", ".join(part for part in parts if part)
-        if street:
-            data["address"] = street.strip()
+    types = json_ld_types(payload)
+    if types:
+        # Report the lodging type when the block lists several.
+        lodging = [value for value in types if value.lower() in _LODGING_TYPES]
+        data["property_type"] = (lodging or types)[0]
+
+    if address := json_ld_address(payload):
+        data["address"] = address
 
     rating = payload.get("aggregateRating")
     if isinstance(rating, dict):
@@ -140,9 +161,10 @@ def metadata_from_json_ld(payload: dict) -> dict:
     return data
 
 
-# A block needs more than a name to be the property: a lodging @type, or an
-# address or rating. Otherwise a BreadcrumbList or Organization block wins and
-# every report comes out titled "Booking.com".
+# A block must look like the property itself, not merely carry a name: it
+# needs a lodging @type or a guest rating. An address alone is not enough —
+# Booking.com's own Organization block has one, and picking it would title
+# every report "Booking.com".
 MIN_JSON_LD_SCORE = 3
 
 
@@ -151,12 +173,12 @@ def json_ld_score(payload: dict) -> int:
     if not isinstance(payload, dict) or not payload.get("name"):
         return 0
     score = 1
-    if str(payload.get("@type", "")).lower() in _LODGING_TYPES:
+    if any(value.lower() in _LODGING_TYPES for value in json_ld_types(payload)):
         score += 4
     if isinstance(payload.get("aggregateRating"), dict):
         score += 2
-    if payload.get("address"):
-        score += 2
+    if json_ld_address(payload):
+        score += 1
     return score
 
 
